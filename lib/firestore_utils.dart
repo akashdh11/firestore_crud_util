@@ -6,98 +6,60 @@ import 'package:firestore_crud_util/utility/logger.dart';
 import 'package:firestore_crud_util/utility/shared_prefs.dart';
 
 class FirestoreUtils {
-  static Future<QuerySnapshot> _getCollectionWhereGreaterThan(
-    String collection,
-    String docName,
-    int version,
-  ) {
-    return FirebaseFirestore.instance
-        .collection(collection)
-        .where("docName", isEqualTo: docName)
-        .where("version", isGreaterThan: version)
-        .get();
-  }
-
   static Future<T> getData<T>({
     required String collection,
     required String docName,
     required int docVersion,
     required T docData,
   }) async {
-    int prefDocVersion =
+    int currentVersion =
         await SharedPrefs.getInt(key: "${docName}Version") ?? 0;
 
-    if (prefDocVersion < docVersion) {
-      logger.i(
-        "$docName: already latest data data provided, updating SharedPrefs",
-      );
+    if (currentVersion < docVersion) {
+      logger.i("$docName: Updating prefDocVersion to provided docVersion");
       await SharedPrefs.setInt(key: "${docName}Version", value: docVersion);
-      prefDocVersion = docVersion;
+      currentVersion = docVersion;
     }
-    QuerySnapshot querySnapshot = await _getCollectionWhereGreaterThan(
-      collection,
-      docName,
-      prefDocVersion,
-    );
+
+    QuerySnapshot querySnapshot =
+        await FirebaseFirestore.instance
+            .collection(collection)
+            .where("docName", isEqualTo: docName)
+            .where("version", isGreaterThan: currentVersion)
+            .orderBy("version", descending: true)
+            .limit(1)
+            .get();
 
     if (querySnapshot.docs.isNotEmpty) {
-      logger.i("$docName: new version found fetching firestore data");
-      loggerNoStack.i(querySnapshot.docs.first.get('data'));
-      FileIO.writeToFile(
-        fileName: docName,
-        data: jsonEncode(querySnapshot.docs.first.get('data')),
-      );
-      await SharedPrefs.setInt(
-        key: "${docName}Version",
-        value: querySnapshot.docs.first.get('version') as int,
-      );
-      try {
-        return querySnapshot.docs.first.get('data') as T;
-      } catch (e) {
-        logger.e("Error", error: e);
-        throw Exception(e);
-      }
-    } else if (querySnapshot.metadata.isFromCache) {
-      logger.i(
-        "$docName: no data fetched from firestore returning hardcoded data",
-      );
-      loggerNoStack.i(docData);
-      return docData;
-    } else if (prefDocVersion == docVersion) {
-      logger.i(
-        "$docName: already latest data data provided, returning same data",
-      );
-      loggerNoStack.i(docData);
-      return docData;
-    } else {
-      try {
-        String dataString = await FileIO.readFromFile(fileName: docName);
-        logger.i("$docName: firestore data fetched from file");
-        var data = jsonDecode(dataString);
-        loggerNoStack.i(data);
-        return data as T;
-      } catch (e) {
-        await SharedPrefs.setInt(key: "${docName}Version", value: docVersion);
-        return getData<T>(
-          collection: collection,
-          docName: docName,
-          docVersion: docVersion,
-          docData: docData,
+      var latestDoc = querySnapshot.docs.first;
+      int latestVersion = latestDoc.get('version') as int;
+      if (latestVersion > currentVersion) {
+        logger.i("$docName: Newer version $latestVersion found in Firestore");
+        await FileIO.writeToFile(
+          fileName: docName,
+          data: jsonEncode(latestDoc.get('data')),
         );
+        await SharedPrefs.setInt(
+          key: "${docName}Version",
+          value: latestVersion,
+        );
+        return latestDoc.get('data') as T;
       }
     }
-  }
 
-  static Stream<QuerySnapshot> _getCollectionStreamWhereGreaterThan(
-    String collection,
-    String docName,
-    int version,
-  ) {
-    return FirebaseFirestore.instance
-        .collection(collection)
-        .where("docName", isEqualTo: docName)
-        .where("version", isGreaterThan: version)
-        .snapshots();
+    // No newer version in Firestore, use local data if available and newer
+    if (currentVersion > docVersion) {
+      try {
+        String dataString = await FileIO.readFromFile(fileName: docName);
+        logger.i("$docName: Using local data, version $currentVersion");
+        return jsonDecode(dataString) as T;
+      } catch (e) {
+        logger.w("$docName: Local file read failed, falling back to docData");
+      }
+    }
+
+    logger.i("$docName: Returning provided docData");
+    return docData;
   }
 
   static Stream<T> getDataStream<T>({
@@ -106,66 +68,55 @@ class FirestoreUtils {
     required int docVersion,
     required T docData,
   }) async* {
-    int prefDocVersion =
+    int currentVersion =
         await SharedPrefs.getInt(key: "${docName}Version") ?? 0;
 
-    if (prefDocVersion <= docVersion) {
-      yield docData;
-      logger.i(
-        "$docName: returning data provided in stream, checking firebase",
-      );
-      await SharedPrefs.setInt(key: "${docName}Version", value: docVersion);
-      prefDocVersion = docVersion;
-    } else {
+    // Yield initial data
+    T currentData = docData;
+    if (currentVersion > docVersion) {
       try {
         String dataString = await FileIO.readFromFile(fileName: docName);
-        logger.i(
-          "$docName: returning data from file in stream, checking firebase",
-        );
-        var data = jsonDecode(dataString);
-        loggerNoStack.i(data);
-        yield data as T;
+        currentData = jsonDecode(dataString) as T;
+        logger.i("$docName: Yielding local data, version $currentVersion");
       } catch (e) {
-        logger.i("$docName: file data corrupted, fetching from firebase");
-        await SharedPrefs.setInt(key: "${docName}Version", value: docVersion);
-        yield await getData<T>(
-          collection: collection,
-          docName: docName,
-          docVersion: docVersion,
-          docData: docData,
-        );
-      }
-    }
-
-    await for (QuerySnapshot querySnapshot
-        in _getCollectionStreamWhereGreaterThan(
-          collection,
-          docName,
-          docVersion,
-        )) {
-      if (querySnapshot.docs.isNotEmpty) {
-        logger.i("$docName: firestore data fetched from firebase");
-        loggerNoStack.i(querySnapshot.docs.first.get('data'));
-        FileIO.writeToFile(
-          fileName: docName,
-          data: jsonEncode(querySnapshot.docs.first.get('data')),
-        );
+        logger.w("$docName: Local file read failed, using docData");
+        currentVersion = docVersion;
         await SharedPrefs.setInt(
           key: "${docName}Version",
-          value: querySnapshot.docs.first.get('version') as int,
+          value: currentVersion,
         );
-        try {
-          yield querySnapshot.docs.first.get('data') as T;
-        } catch (e) {
-          logger.e("Error", error: e);
-          throw Exception(e);
+      }
+    } else if (currentVersion < docVersion) {
+      currentVersion = docVersion;
+      await SharedPrefs.setInt(key: "${docName}Version", value: currentVersion);
+    }
+    yield currentData;
+
+    // Listen for updates
+    await for (QuerySnapshot querySnapshot
+        in FirebaseFirestore.instance
+            .collection(collection)
+            .where("docName", isEqualTo: docName)
+            .where("version", isGreaterThan: currentVersion)
+            .orderBy("version", descending: true)
+            .limit(1)
+            .snapshots()) {
+      if (querySnapshot.docs.isNotEmpty) {
+        var latestDoc = querySnapshot.docs.first;
+        int latestVersion = latestDoc.get('version') as int;
+        if (latestVersion > currentVersion) {
+          logger.i("$docName: New version $latestVersion from Firestore");
+          await FileIO.writeToFile(
+            fileName: docName,
+            data: jsonEncode(latestDoc.get('data')),
+          );
+          currentVersion = latestVersion;
+          await SharedPrefs.setInt(
+            key: "${docName}Version",
+            value: currentVersion,
+          );
+          yield latestDoc.get('data') as T;
         }
-      } else if (querySnapshot.metadata.isFromCache) {
-        logger.i(
-          "$docName: no data fetched from firebase/cache returning hardcoded data",
-        );
-        loggerNoStack.i(docData);
-        yield docData;
       }
     }
   }
